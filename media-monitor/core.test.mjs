@@ -19,6 +19,8 @@ test('RAVE rejects missing, negative and non-numeric measurements', () => {
   assert.equal(calculateRave({ medium: 'online', measurementCm: 0 }), 0);
   assert.equal(calculateRave({ medium: 'online', measurementCm: 'not-a-number' }), 0);
   assert.equal(calculateRave({ medium: 'print', measurementCm: 4, columns: 0 }), 0);
+  assert.equal(calculateRave({ medium: 'print', measurementCm: 4, columns: 1.5 }), 0);
+  assert.equal(calculateRave({ medium: 'online', measurementCm: 1e308 }), 0);
   assert.equal(calculateRave({ medium: 'video', measurementCm: 4 }), 0);
 });
 
@@ -62,6 +64,10 @@ test('report readiness requires verification and a screenshot plus all report fi
   assert.deepEqual(getCoverageCompleteness(article), []);
   assert.deepEqual(getReportReadiness([article]), { ready: true, reasons: [] });
   assert.equal(getReportReadiness([{ ...article, screenshotDataUrl: '' }]).ready, false);
+  assert.equal(getReportReadiness([{ ...article, screenshotDataUrl: 'data:image/png;base64,' }]).ready, false);
+  assert.equal(getReportReadiness([{ ...article, screenshotDataUrl: 'data:image/png;base64,not-base64!' }]).ready, false);
+  assert.equal(getReportReadiness([{ ...article, publishedAt: '2026-02-30' }]).ready, false);
+  assert.equal(getReportReadiness([{ ...article, publishedAt: 'not-a-date' }]).ready, false);
   assert.equal(getReportReadiness([{ ...article, verificationStatus: 'pending' }]).ready, false);
 });
 

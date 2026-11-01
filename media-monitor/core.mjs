@@ -11,13 +11,14 @@ export function calculateRave({ medium, measurementCm, columns = 1 } = {}) {
   const centimetres = Number(measurementCm);
   if (!Number.isFinite(centimetres) || centimetres <= 0) return 0;
 
-  if (medium === 'online') return centimetres * 6 * 95;
+  let rave = 0;
+  if (medium === 'online') rave = centimetres * 6 * 95;
   if (medium === 'print') {
     const columnCount = Number(columns);
-    if (!Number.isFinite(columnCount) || columnCount <= 0) return 0;
-    return centimetres * columnCount * 115;
+    if (!Number.isInteger(columnCount) || columnCount <= 0) return 0;
+    rave = centimetres * columnCount * 115;
   }
-  return 0;
+  return Number.isFinite(rave) ? rave : 0;
 }
 
 /** Return an absolute rolling time window for the active monitoring mode. */
@@ -54,18 +55,25 @@ export function buildOutletQuery({ query = '', url = '' } = {}) {
 }
 
 /** Return missing fields that prevent an item from entering an approved report. */
+function isValidDateOnly(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
 export function getCoverageCompleteness(article = {}) {
   const missing = [];
   if (!String(article.title ?? '').trim()) missing.push('content title');
-  if (!String(article.publishedAt ?? '').trim()) missing.push('publication date');
+  if (!isValidDateOnly(article.publishedAt)) missing.push('publication date');
   if (!String(article.outletName ?? '').trim()) missing.push('media platform');
   if (!['online', 'print'].includes(article.medium)) missing.push('platform type');
   if (!isHttpUrl(article.link)) missing.push('working article link');
   if (!['positive', 'neutral', 'negative'].includes(article.tone)) missing.push('tone');
-  if (!Number.isFinite(Number(article.measurementCm)) || Number(article.measurementCm) <= 0) {
+  const measurement = Number(article.measurementCm);
+  if (!Number.isFinite(measurement) || measurement <= 0 || (['online', 'print'].includes(article.medium) && calculateRave({ medium: article.medium, measurementCm: measurement, columns: article.columns }) <= 0)) {
     missing.push('size measurement in cm');
   }
-  if (article.medium === 'print' && (!Number.isFinite(Number(article.columns)) || Number(article.columns) <= 0)) {
+  if (article.medium === 'print' && (!Number.isInteger(Number(article.columns)) || Number(article.columns) <= 0)) {
     missing.push('print column count');
   }
   if (!isScreenshot(article.screenshotDataUrl)) missing.push('article screenshot');
@@ -104,7 +112,9 @@ export function isHttpUrl(value) {
 }
 
 export function isScreenshot(value) {
-  return typeof value === 'string' && /^data:image\/(?:jpeg|png|webp);base64,/i.test(value);
+  if (typeof value !== 'string') return false;
+  const match = value.match(/^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/i);
+  return Boolean(match && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(match[1]));
 }
 
 export function countByTone(articles = []) {

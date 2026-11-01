@@ -27,7 +27,7 @@ node --test media-monitor/core.test.mjs
 5. Calculate RAVE exactly as requested: online measurement in cm × 6 × 95; print measurement in cm × columns × 115.
 6. Prepare a first-verification email draft. Executive reviewers can approve references or request corrections.
 7. Block final report compilation until all references are executive-verified and required report details—including screenshots—are present. The final report separates positive/neutral references from a highlighted negative section.
-8. Route the compiled report to the executive for final approval. Only the Monitoring Head role can prepare client delivery after approval. Download a print-ready HTML report, then send it through the team's approved email channel.
+8. Compilation creates an **unsent draft**. The Monitoring team downloads the report, prepares the final-approval email, and confirms only after sending it through the approved channel; the executive can then approve or request changes. Only the Monitoring Head role can prepare client delivery after approval. Download the approved print-ready HTML report and confirm delivery after sending it to the client.
 
 ## Important limits
 

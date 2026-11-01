@@ -7,6 +7,7 @@ import {
   getMonitoringWindow,
   getReportReadiness,
   isHttpUrl,
+  isScreenshot,
 } from './core.mjs';
 
 const STORAGE_KEY = 'signal-desk.workspace.v1';
@@ -128,21 +129,79 @@ function makeSeedState() {
   };
 }
 
+function isRecord(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+function asString(value) { return typeof value === 'string' ? value : ''; }
+
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed?.schemaVersion === 1 && Array.isArray(parsed.clients) && Array.isArray(parsed.outlets) && Array.isArray(parsed.coverage)) {
-        return { schemaVersion: 1, clients: parsed.clients, outlets: parsed.outlets, runs: Array.isArray(parsed.runs) ? parsed.runs : [], coverage: parsed.coverage, reviewRequests: Array.isArray(parsed.reviewRequests) ? parsed.reviewRequests : [], reports: Array.isArray(parsed.reports) ? parsed.reports : [], activity: Array.isArray(parsed.activity) ? parsed.activity : [] };
-      }
-    }
+    if (!raw) return makeSeedState();
+    const parsed = JSON.parse(raw);
+    if (parsed?.schemaVersion !== 1 || !Array.isArray(parsed.clients) || !Array.isArray(parsed.outlets) || !Array.isArray(parsed.coverage)) return makeSeedState();
+
+    const clients = parsed.clients.filter((client) => isRecord(client) && asString(client.id).trim() && asString(client.name).trim()).map((client) => ({
+      ...client,
+      id: client.id,
+      name: client.name,
+      keyTerms: asString(client.keyTerms),
+      pressReleases: (Array.isArray(client.pressReleases) ? client.pressReleases : [])
+        .filter((release) => isRecord(release) && asString(release.id).trim() && asString(release.title).trim())
+        .map((release) => ({ ...release, monitoringType: release.monitoringType === 'magazine' ? 'magazine' : 'daily' })),
+    }));
+    const clientIds = new Set(clients.map((client) => client.id));
+    const releaseOwners = new Map(clients.flatMap((client) => client.pressReleases.map((release) => [release.id, client.id])));
+    const outlets = parsed.outlets.filter((outlet) => isRecord(outlet) && asString(outlet.id).trim() && asString(outlet.name).trim()).map((outlet) => ({
+      ...outlet, id: outlet.id, name: outlet.name, url: asString(outlet.url), language: asString(outlet.language), category: asString(outlet.category),
+    }));
+    const runs = (Array.isArray(parsed.runs) ? parsed.runs : []).filter((run) => isRecord(run) && asString(run.id).trim() && clientIds.has(run.clientId) && releaseOwners.get(run.releaseId) === run.clientId).map((run) => ({
+      ...run,
+      mode: run.mode === 'magazine' ? 'magazine' : 'daily',
+      extended: run.extended === true,
+      fallback: run.fallback === true,
+      searchEngines: isRecord(run.searchEngines) ? { google: run.searchEngines.google === true, bing: run.searchEngines.bing === true } : { google: false, bing: false },
+      searchedOutlets: Array.isArray(run.searchedOutlets) ? run.searchedOutlets.filter((id) => typeof id === 'string') : [],
+    }));
+    const coverage = parsed.coverage.filter((article) => isRecord(article) && asString(article.id).trim() && clientIds.has(article.clientId) && releaseOwners.get(article.releaseId) === article.clientId).map((article) => ({
+      ...article,
+      title: asString(article.title),
+      outletName: asString(article.outletName),
+      publishedAt: asString(article.publishedAt),
+      link: asString(article.link),
+      screenshotDataUrl: asString(article.screenshotDataUrl),
+    }));
+    const reviewRequests = (Array.isArray(parsed.reviewRequests) ? parsed.reviewRequests : []).filter((request) => isRecord(request) && asString(request.id).trim() && clientIds.has(request.clientId)).map((request) => ({
+      ...request, coverageIds: Array.isArray(request.coverageIds) ? request.coverageIds.filter((id) => typeof id === 'string') : [],
+    }));
+    const reports = (Array.isArray(parsed.reports) ? parsed.reports : []).filter((report) => isRecord(report) && asString(report.id).trim() && clientIds.has(report.clientId) && Array.isArray(report.items)).map((report) => {
+      const normalized = {
+        ...report,
+        clientName: asString(report.clientName),
+        finalApprovalRequestedAt: asString(report.finalApprovalRequestedAt),
+        status: ['draft', 'pending-final', 'approved', 'changes', 'sent'].includes(report.status) ? report.status : 'draft',
+        coverageIds: Array.isArray(report.coverageIds) ? report.coverageIds.filter((id) => typeof id === 'string') : [],
+        items: report.items.filter(isRecord),
+      };
+      // Before explicit email handoff was added, compilation incorrectly set pending-final.
+      if (normalized.status === 'pending-final' && !normalized.finalApprovalRequestedAt) normalized.status = 'draft';
+      return normalized;
+    });
+    const activity = (Array.isArray(parsed.activity) ? parsed.activity : []).filter((item) => isRecord(item) && clientIds.has(item.clientId)).map((item) => ({
+      ...item, id: asString(item.id), text: asString(item.text), createdAt: asString(item.createdAt),
+    }));
+    return { schemaVersion: 1, clients, outlets, runs, coverage, reviewRequests, reports, activity };
   } catch { /* Ignore malformed browser storage and use the local demo workspace. */ }
   return makeSeedState();
 }
 
+function loadPreferences() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PREFERENCES_KEY) || '{}');
+    return isRecord(parsed) ? parsed : {};
+  } catch { return {}; }
+}
+
 let state = loadState();
-let preferences = (() => { try { return JSON.parse(localStorage.getItem(PREFERENCES_KEY) || '{}'); } catch { return {}; } })();
+let preferences = loadPreferences();
 let currentView = 'overview';
 let selectedClientId = state.clients.some((client) => client.id === preferences.clientId) ? preferences.clientId : state.clients[0]?.id ?? '';
 let selectedReleaseId = '';
@@ -152,6 +211,8 @@ let coverageSearchTerm = '';
 let outletSearchTerm = '';
 let showDismissedBanner = preferences.bannerDismissed === true;
 let activeScreenshotData = '';
+let screenshotPending = false;
+let screenshotToken = 0;
 let toastTimer = 0;
 
 const pageContent = document.querySelector('#pageContent');
@@ -181,14 +242,27 @@ function formatRave(value) { return new Intl.NumberFormat('en', { maximumFractio
 function shortName(value = '') { return String(value).split(/[\s·-]+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join('').toUpperCase() || '—'; }
 function platformLabel(medium) { return medium === 'print' ? 'Print' : 'Online'; }
 function toneLabel(tone) { return ({ positive: 'Positive', neutral: 'Neutral', negative: 'Negative' })[tone] ?? 'Unclassified'; }
-function statusLabel(status) { return ({ unreviewed: 'Not reviewed', pending: 'Awaiting review', approved: 'Verified', changes: 'Changes requested', 'pending-final': 'Awaiting final approval', sent: 'Sent to client', rejected: 'Changes requested' })[status] ?? 'Draft'; }
+function statusLabel(status) { return ({ unreviewed: 'Not reviewed', pending: 'Awaiting review', approved: 'Verified', changes: 'Changes requested', 'pending-final': 'Awaiting final approval', sent: 'Sent to client', rejected: 'Changes requested', draft: 'Draft · unsent' })[status] ?? 'Draft'; }
+function reportStatusLabel(status) { return ({ draft: 'Draft · unsent', 'pending-final': 'Awaiting final approval', approved: 'Final approval complete', changes: 'Changes requested', sent: 'Sent to client' })[status] ?? 'Draft'; }
 function toneBadge(tone) { return `<span class="tone-badge tone-${esc(tone)}">${esc(toneLabel(tone))}</span>`; }
-function statusBadge(status) { const style = status === 'approved' ? 'approved' : status === 'sent' ? 'sent' : status === 'changes' || status === 'rejected' ? 'changes' : status === 'pending' || status === 'pending-final' ? 'pending' : 'draft'; return `<span class="status-badge status-${style}">${esc(statusLabel(status))}</span>`; }
+function statusBadge(status, context = 'coverage') { const style = status === 'approved' ? 'approved' : status === 'sent' ? 'sent' : status === 'changes' || status === 'rejected' ? 'changes' : status === 'pending' || status === 'pending-final' ? 'pending' : 'draft'; const label = context === 'report' ? reportStatusLabel(status) : statusLabel(status); return `<span class="status-badge status-${style}">${esc(label)}</span>`; }
 function platformBadge(medium) { return `<span class="platform-badge">${esc(platformLabel(medium))}</span>`; }
-function safeImage(value) { return typeof value === 'string' && /^data:image\/(?:jpeg|png|webp);base64,/i.test(value) ? value : ''; }
+function safeImage(value) { return isScreenshot(value) ? value : ''; }
 function currentRun() { return getRun(selectedClientId, selectedReleaseId); }
 function currentArticles() { return articlesForClient(selectedClientId); }
 function latestReport(clientId = selectedClientId) { return state.reports.filter((report) => report.clientId === clientId).sort((a, b) => String(b.compiledAt).localeCompare(String(a.compiledAt)))[0] ?? null; }
+function hasCoverageChangedSinceReport(report, articles) {
+  const reportCoverageIds = Array.isArray(report?.coverageIds) ? report.coverageIds : [];
+  if (reportCoverageIds.length !== articles.length) return true;
+  const snapshots = new Map((Array.isArray(report?.items) ? report.items : []).filter(isRecord).map((item) => [item.id, item]));
+  const trackedFields = ['clientId', 'releaseId', 'outletId', 'outletName', 'title', 'publishedAt', 'medium', 'link', 'tone', 'measurementCm', 'columns', 'wordCount', 'screenshotDataUrl', 'source', 'notes', 'verificationStatus', 'verificationNote', 'verifiedBy', 'verifiedAt'];
+  return articles.some((article) => {
+    if (!reportCoverageIds.includes(article.id)) return true;
+    const snapshot = snapshots.get(article.id);
+    if (!snapshot || String(article.updatedAt ?? article.createdAt) > String(report.compiledAt)) return true;
+    return trackedFields.some((field) => article[field] !== snapshot[field]);
+  });
+}
 function getSearchProgress(run) {
   if (!run) return { done: 0, total: state.outlets.length + 2, percent: 0, outletCount: 0, engineCount: 0 };
   const outletCount = (run.searchedOutlets ?? []).filter((id) => state.outlets.some((outlet) => outlet.id === id)).length;
@@ -227,7 +301,8 @@ function toast(message, kind = 'success') {
   window.clearTimeout(toastTimer); toastTimer = window.setTimeout(() => node.remove(), 4300);
 }
 function showDialog(title, eyebrow, html) { dialogTitle.textContent = title; dialogEyebrow.textContent = eyebrow; dialogBody.innerHTML = html; dialog.showModal(); }
-function closeDialog() { if (dialog.open) dialog.close(); dialogBody.innerHTML = ''; activeScreenshotData = ''; }
+function cancelScreenshotCompression() { screenshotToken += 1; screenshotPending = false; }
+function closeDialog() { cancelScreenshotCompression(); if (dialog.open) dialog.close(); dialogBody.innerHTML = ''; activeScreenshotData = ''; }
 function navigate(view) {
   if (!['overview', 'search', 'coverage', 'approvals', 'reports', 'setup'].includes(view)) return;
   currentView = view; document.querySelector('#sidebar').classList.remove('is-open'); document.querySelector('#mobileMenu').setAttribute('aria-expanded', 'false');
@@ -246,7 +321,7 @@ function renderSidebar() {
   document.querySelector('#roleName').textContent = roleNames[activeRole]; document.querySelector('#roleCaption').textContent = 'Workspace role'; document.querySelector('#avatarInitials').textContent = initials[activeRole];
   const clientCoverage = currentArticles(); document.querySelector('#coverageNavCount').textContent = String(clientCoverage.length);
   const pendingCount = clientCoverage.filter((article) => ['unreviewed', 'pending', 'changes'].includes(article.verificationStatus)).length;
-  const finalPending = latestReport()?.status === 'pending-final' ? 1 : 0; const attentionCount = pendingCount + finalPending;
+  const finalPending = ['draft', 'pending-final'].includes(latestReport()?.status) ? 1 : 0; const attentionCount = pendingCount + finalPending;
   const approvalCount = document.querySelector('#approvalNavCount'); approvalCount.textContent = String(attentionCount); approvalCount.hidden = attentionCount === 0;
   const run = latestRunForClient(selectedClientId); document.querySelector('#workspaceStatus').textContent = run ? `${getSearchProgress(run).outletCount}/${state.outlets.length} outlet checks logged` : 'No active search';
   document.querySelector('.mini-status-dot').classList.toggle('is-live', Boolean(run));
@@ -287,7 +362,7 @@ function renderOverview() {
   const client = getClient(); const articles = currentArticles().slice().sort((a, b) => String(b.publishedAt).localeCompare(String(a.publishedAt)) || String(b.createdAt).localeCompare(String(a.createdAt)));
   const negative = articles.filter((article) => article.tone === 'negative'); const awaiting = articles.filter((article) => ['unreviewed', 'pending', 'changes'].includes(article.verificationStatus)); const totalRave = articles.reduce((sum, article) => sum + articleRave(article), 0); const latest = articles.slice(0, 5);
   const name = client?.name ?? 'your clients'; const hour = new Date().getHours(); const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
-  const actions = `<button class="button button-secondary" data-action="add-coverage"><span class="button-icon">＋</span>Add coverage</button><button class="button button-primary" data-action="go-search">Start monitoring ${icon('arrow')}</button>`;
+  const actions = `${activeRole === 'monitor' ? '<button class="button button-secondary" data-action="add-coverage"><span class="button-icon">＋</span>Add coverage</button>' : ''}<button class="button button-primary" data-action="go-search">Start monitoring ${icon('arrow')}</button>`;
   return `${pageHeading('Monitoring workspace', `${greeting}, team.`, `Here’s the latest on <strong>${esc(name)}</strong>. Keep the signal clear: verify every reference, surface negative coverage, then send only an approved report.`, actions)}<div class="metrics-grid">${metricCard('Coverage items', formatNumber(articles.length), `<strong>${articles.length ? 'Tracked' : 'Ready'}</strong><span>for this client</span>`, 'layers')}${metricCard('Negative coverage', formatNumber(negative.length), `<span class="negative-copy">${negative.length ? 'Priority review' : 'No negative items'}</span><span>highlighted separately</span>`, 'alert', 'metric-icon--negative')}${metricCard('Awaiting verification', formatNumber(awaiting.length), `<span>${awaiting.length ? 'Executive action' : 'All clear'}</span><span>first review stage</span>`, 'clock', 'metric-icon--gold')}${metricCard('Estimated RAVE', formatRave(totalRave), `<span>Based on recorded size</span><span>not an audited media value</span>`, 'file', 'metric-icon--blue')}</div><div class="dashboard-grid"><div class="dashboard-main"><section class="card coverage-preview"><div class="card-header"><div><h2 class="card-title">Latest coverage</h2><p class="card-subtitle">${esc(name)} · ${articles.length} tracked references</p></div><div class="card-header-actions"><button class="text-button" data-action="go-coverage">View all ${icon('arrow')}</button></div></div><div class="coverage-head coverage-row"><span>CONTENT</span><span>PUBLICATION</span><span>TONE</span><span style="text-align:right">RAVE</span></div>${latest.length ? latest.map(renderCoveragePreviewRow).join('') : '<div class="empty-inline">No coverage yet. Start the search plan or add a reference you have already found.</div>'}</section>${negative.length ? `<div class="negative-strip"><span class="negative-strip-icon">!</span><div class="negative-strip-copy"><strong>${negative.length} negative ${negative.length === 1 ? 'mention needs' : 'mentions need'} careful review</strong><span>Negative coverage is called out separately in the approval and report stages.</span></div><button class="text-button" data-action="go-approvals">Review now ${icon('arrow')}</button></div>` : ''}</div><aside class="dashboard-rail">${renderRunCard(client)}${renderDistribution()}${renderActivityCard(client?.id)}</aside></div>`;
 }
 
@@ -318,7 +393,7 @@ function renderSearchPlan() {
   const inRun = run ? state.coverage.filter((article) => article.runId === run.id) : []; const allChecked = progress.outletCount === state.outlets.length && progress.engineCount === 2;
   const canExtend = run?.mode !== 'magazine' && !run?.extended && inRun.length === 0 && allChecked; const window = getWindowForRun(run, release); const exactFallbackText = exactQuery;
   const outlets = state.outlets.slice().sort((a, b) => a.name.localeCompare(b.name));
-  const actions = `${run ? `<button class="button button-secondary" data-action="new-search-run">New monitoring run</button>` : ''}<button class="button button-secondary" data-action="add-coverage"><span class="button-icon">＋</span>Log coverage</button>${run ? '' : `<button class="button button-primary" data-action="start-search">Start this search ${icon('arrow')}</button>`}`;
+  const actions = `${run ? `<button class="button button-secondary" data-action="new-search-run">New monitoring run</button>` : ''}${activeRole === 'monitor' ? '<button class="button button-secondary" data-action="add-coverage"><span class="button-icon">＋</span>Log coverage</button>' : ''}${run ? '' : `<button class="button button-primary" data-action="start-search">Start this search ${icon('arrow')}</button>`}`;
   return `${pageHeading('Collection · Phase 1', 'Search plan', 'Search the exact release title first. If it returns nothing, switch to the client name and key terms. Then check every designated outlet directly and log what you searched.', actions)}<div class="search-layout"><div class="search-main">
     <section class="card campaign-card"><div class="campaign-card-heading"><div><h2>Monitoring scope</h2><p>One search plan per press release. Search progress is saved in this browser.</p></div>${run ? `<span class="window-badge">${esc(run.mode === 'magazine' ? 'Magazine · 30 days' : run.extended ? 'Fallback · 3 days' : 'Default · 24 hours')}</span>` : '<span class="status-badge status-draft">Not started</span>'}</div><div class="form-grid">
       <div class="form-field form-field--full"><label class="form-label" for="releaseSelect">Press release title · keyword 1</label><select class="select" id="releaseSelect">${renderReleaseOptions(client, release.id)}</select><span class="form-hint">Use the title exactly as it appeared in the issued release.</span></div>
@@ -340,13 +415,16 @@ function renderNoClient(message) { return `${pageHeading('Workspace setup', 'Sta
 function renderCoverageTableRow(article) {
   const outlet = getOutlet(article.outletId); const link = safeUrl(article.link); const incomplete = getCoverageCompleteness(article);
   const searchText = `${article.title} ${article.outletName} ${article.tone}`.toLowerCase();
-  return `<tr class="${article.tone === 'negative' ? 'is-negative' : ''}" data-coverage-search="${esc(searchText)}"><td><div class="table-title">${esc(article.title)}</div><div class="table-sub">${esc(getClient(article.clientId)?.name ?? '')} · ${esc(outlet?.category ?? 'Media')}</div></td><td><div class="outlet-cell"><span class="outlet-monogram">${esc(shortName(article.outletName))}</span><span class="outlet-name">${esc(article.outletName)}</span></div></td><td>${esc(formatDate(article.publishedAt, { month: 'short', day: 'numeric', year: 'numeric' }))}</td><td>${toneBadge(article.tone)}</td><td>${platformBadge(article.medium)}<div class="table-sub">${Number(article.measurementCm || 0).toFixed(1)} cm${article.medium === 'print' ? ` · ${esc(article.columns)} col` : article.wordCount ? ` · ${formatNumber(article.wordCount)} words` : ''}</div></td><td><span class="table-rave">${formatRave(articleRave(article))}</span></td><td>${statusBadge(article.verificationStatus)}${incomplete.includes('article screenshot') ? '<div class="table-sub">Screenshot needed</div>' : ''}</td><td>${link ? `<a class="table-link" href="${esc(link)}" target="_blank" rel="noopener noreferrer">Open link ${icon('external')}</a>` : '<span class="table-sub">No link</span>'}</td><td><div class="table-actions"><button class="icon-button" title="Edit coverage" aria-label="Edit ${esc(article.title)}" data-action="edit-coverage" data-id="${esc(article.id)}">✎</button><button class="icon-button" title="Delete coverage" aria-label="Delete ${esc(article.title)}" data-action="delete-coverage" data-id="${esc(article.id)}">×</button></div></td></tr>`;
+  const rowActions = activeRole === 'monitor'
+    ? `<div class="table-actions"><button class="icon-button" title="Edit coverage" aria-label="Edit ${esc(article.title)}" data-action="edit-coverage" data-id="${esc(article.id)}">✎</button><button class="icon-button" title="Delete coverage" aria-label="Delete ${esc(article.title)}" data-action="delete-coverage" data-id="${esc(article.id)}">×</button></div>`
+    : '<span class="table-sub">Monitoring team maintains coverage</span>';
+  return `<tr class="${article.tone === 'negative' ? 'is-negative' : ''}" data-coverage-search="${esc(searchText)}"><td><div class="table-title">${esc(article.title)}</div><div class="table-sub">${esc(getClient(article.clientId)?.name ?? '')} · ${esc(outlet?.category ?? 'Media')}</div></td><td><div class="outlet-cell"><span class="outlet-monogram">${esc(shortName(article.outletName))}</span><span class="outlet-name">${esc(article.outletName)}</span></div></td><td>${esc(formatDate(article.publishedAt, { month: 'short', day: 'numeric', year: 'numeric' }))}</td><td>${toneBadge(article.tone)}</td><td>${platformBadge(article.medium)}<div class="table-sub">${Number(article.measurementCm || 0).toFixed(1)} cm${article.medium === 'print' ? ` · ${esc(article.columns)} col` : article.wordCount ? ` · ${formatNumber(article.wordCount)} words` : ''}</div></td><td><span class="table-rave">${formatRave(articleRave(article))}</span></td><td>${statusBadge(article.verificationStatus)}${incomplete.includes('article screenshot') ? '<div class="table-sub">Screenshot needed</div>' : ''}</td><td>${link ? `<a class="table-link" href="${esc(link)}" target="_blank" rel="noopener noreferrer">Open link ${icon('external')}</a>` : '<span class="table-sub">No link</span>'}</td><td>${rowActions}</td></tr>`;
 }
 function renderCoverage() {
   const client = getClient(); if (!client) return renderNoClient('Add a client and release to organize discovered coverage.');
   const articles = currentArticles().slice().sort((a, b) => String(b.publishedAt).localeCompare(String(a.publishedAt)) || String(b.createdAt).localeCompare(String(a.createdAt)));
   const filtered = articles.filter((article) => (coverageToneFilter === 'all' || article.tone === coverageToneFilter) && `${article.title} ${article.outletName} ${article.tone}`.toLowerCase().includes(coverageSearchTerm.toLowerCase()));
-  const actions = `<button class="button button-primary" data-action="add-coverage"><span class="button-icon">＋</span>Add coverage</button>`;
+  const actions = activeRole === 'monitor' ? `<button class="button button-primary" data-action="add-coverage"><span class="button-icon">＋</span>Add coverage</button>` : '';
   return `${pageHeading('Sorting & analysis · Phase 2', 'Coverage library', `All identified references for <strong>${esc(client.name)}</strong>, grouped by tone. Negative items are highlighted and RAVE is calculated from the recorded measurement.`, actions)}<div class="filter-toolbar"><div class="filter-tabs" role="tablist" aria-label="Filter coverage by tone">${[['all', 'All'], ['positive', 'Positive'], ['neutral', 'Neutral'], ['negative', 'Negative']].map(([key, label]) => `<button class="filter-tab ${coverageToneFilter === key ? 'is-active' : ''}" role="tab" aria-selected="${coverageToneFilter === key}" data-tone-filter="${key}">${label}<span style="margin-left:4px;color:#9ba9a8">${key === 'all' ? articles.length : articles.filter((article) => article.tone === key).length}</span></button>`).join('')}</div><div class="filter-tools-right"><input class="coverage-search" type="search" id="coverageSearch" placeholder="Search title or outlet…" value="${esc(coverageSearchTerm)}" aria-label="Search coverage"/><button class="button button-quiet" data-action="go-approvals">Review queue ${icon('arrow')}</button></div></div>${articles.some((article) => article.tone === 'negative') ? `<div class="negative-strip coverage-alert"><span class="negative-strip-icon">!</span><div class="negative-strip-copy"><strong>Negative coverage is separated for executive attention.</strong><span>Confirm context, accuracy and tone during first verification.</span></div><button class="text-button" data-action="filter-negative">View negative ${icon('arrow')}</button></div>` : ''}<section class="card coverage-table-card"><table class="coverage-table"><thead><tr><th>Content</th><th>Publication</th><th>Date</th><th>Tone</th><th>Format &amp; size</th><th>RAVE</th><th>Verification</th><th>Reference</th><th></th></tr></thead><tbody>${filtered.length ? filtered.map(renderCoverageTableRow).join('') : `<tr><td colspan="9"><div class="table-empty"><strong>${articles.length ? 'No matching coverage' : 'No coverage found yet'}</strong>${articles.length ? 'Change the tone filter or search term.' : 'Run the search plan or add a reference already identified by your team.'}</div></td></tr>`}</tbody></table></section>`;
 }
 
@@ -374,21 +452,33 @@ function renderReadinessList(articles) {
 
 function renderWorkflowReportCard(articles, report) {
   const readiness = getReportReadiness(articles);
+  const canPrepare = activeRole === 'monitor';
   if (!report) {
-    return `<section class="card status-panel"><div class="status-panel-header"><div><h3>Final report approval</h3><p>Compile the verified coverage, then send it to the executive for final approval.</p></div><span class="status-badge status-draft">Not compiled</span></div>${renderReadinessList(articles)}<button class="button button-primary" style="width:100%;margin-top:14px" data-action="compile-report" ${readiness.ready ? '' : 'disabled'}>Compile report for approval ${icon('arrow')}</button></section>`;
+    const roleHint = canPrepare ? '' : '<p class="form-hint" style="margin-top:8px">Switch to Monitoring team to compile a report after all references are verified.</p>';
+    return `<section class="card status-panel"><div class="status-panel-header"><div><h3>Final report approval</h3><p>Compile the verified coverage, prepare the final-approval email and confirm after sending it.</p></div><span class="status-badge status-draft">Not compiled</span></div>${renderReadinessList(articles)}<button class="button button-primary" style="width:100%;margin-top:14px" data-action="compile-report" ${readiness.ready && canPrepare ? '' : 'disabled'}>Compile report ${icon('arrow')}</button>${roleHint}</section>`;
   }
+  const isDraft = report.status === 'draft';
   const isPending = report.status === 'pending-final';
   const isApproved = report.status === 'approved';
   const isSent = report.status === 'sent';
   const isChanges = report.status === 'changes';
-  const hasNewerCoverage = articles.some((article) => !report.coverageIds.includes(article.id) || String(article.updatedAt ?? article.createdAt) > String(report.compiledAt));
-  const revisedReportAction = isChanges
-    ? `<button class="button button-primary" style="width:100%;margin-top:13px" data-action="compile-report" ${readiness.ready && hasNewerCoverage ? '' : 'disabled'}>Compile revised report</button>${!hasNewerCoverage ? '<p class="form-hint" style="margin-top:8px">Update a reference or screenshot in response to the executive note before compiling a new snapshot.</p>' : ''}`
+  const hasCoverageChanges = hasCoverageChangedSinceReport(report, articles);
+  const prepareFinalAction = isDraft && canPrepare && !hasCoverageChanges
+    ? `<button class="button button-primary" style="width:100%;margin-top:13px" data-action="prepare-final-approval" data-id="${esc(report.id)}">Prepare final-approval email ${icon('arrow')}</button>`
     : '';
-  const followOnReportAction = (isApproved || isSent) && hasNewerCoverage
+  const refreshDraftAction = isDraft && canPrepare && hasCoverageChanges
+    ? `<button class="button button-primary" style="width:100%;margin-top:13px" data-action="compile-report">Compile updated report snapshot</button>`
+    : '';
+  const draftRoleHint = isDraft && !canPrepare
+    ? '<div class="note-box"><strong>Report compiled.</strong> The Monitoring team must prepare the final-approval request.</div>'
+    : '';
+  const revisedReportAction = isChanges && canPrepare
+    ? `<button class="button button-primary" style="width:100%;margin-top:13px" data-action="compile-report" ${readiness.ready && hasCoverageChanges ? '' : 'disabled'}>Compile revised report</button>${!hasCoverageChanges ? '<p class="form-hint" style="margin-top:8px">Update a reference or screenshot in response to the executive note before compiling a new snapshot.</p>' : ''}`
+    : '';
+  const followOnReportAction = (isApproved || isSent) && canPrepare && hasCoverageChanges
     ? `<button class="button button-secondary" style="width:100%;margin-top:13px" data-action="compile-report" ${readiness.ready ? '' : 'disabled'}>Compile a new report</button>`
     : '';
-  return `<section class="card status-panel"><div class="status-panel-header"><div><h3>Final report approval</h3><p>Report compiled ${esc(formatDateTime(report.compiledAt))} · ${report.items.length} verified references.</p></div>${statusBadge(report.status)}</div><div class="approval-report-summary"><div class="summary-mini"><strong>${formatNumber(report.items.length)}</strong><span>REFERENCES</span></div><div class="summary-mini"><strong>${formatNumber(report.items.filter((item) => item.tone === 'negative').length)}</strong><span>NEGATIVE</span></div><div class="summary-mini"><strong>${formatRave(report.items.reduce((sum, item) => sum + articleRave(item), 0))}</strong><span>RAVE</span></div></div>${isPending && activeRole === 'executive' ? `<div class="review-item-actions" style="margin-top:13px"><button class="button button-primary button-small" data-action="approve-report" data-id="${esc(report.id)}">Approve final report</button><button class="button button-danger button-small" data-action="request-report-changes" data-id="${esc(report.id)}">Request changes</button></div>` : ''}${isPending && activeRole !== 'executive' ? '<div class="note-box"><strong>Waiting for the executive:</strong> switch to Executive reviewer to record final approval.</div>' : ''}${isApproved && activeRole === 'head' ? `<button class="button button-primary" style="width:100%;margin-top:14px" data-action="deliver-report" data-id="${esc(report.id)}">Prepare client delivery ${icon('arrow')}</button>` : ''}${isApproved && activeRole !== 'head' ? '<div class="note-box"><strong>Final approval complete.</strong> The Monitoring Head can prepare client delivery.</div>' : ''}${isSent ? `<div class="approval-seal" style="margin-top:13px"><span class="approval-seal-icon">✓</span><div><strong>Delivered to client</strong><span>${esc(formatDateTime(report.sentAt))}</span></div></div>` : ''}${isChanges ? `<div class="note-box"><strong>Changes requested:</strong> ${esc(report.reviewNote || 'Review the executive note, update coverage, then compile a new report.')}</div>${revisedReportAction}` : followOnReportAction}<button class="button button-secondary" style="width:100%;margin-top:11px" data-action="go-reports">Open report preview ${icon('arrow')}</button></section>`;
+  return `<section class="card status-panel"><div class="status-panel-header"><div><h3>Final report approval</h3><p>Report compiled ${esc(formatDateTime(report.compiledAt))} · ${report.items.length} verified references.</p></div>${statusBadge(report.status, 'report')}</div><div class="approval-report-summary"><div class="summary-mini"><strong>${formatNumber(report.items.length)}</strong><span>REFERENCES</span></div><div class="summary-mini"><strong>${formatNumber(report.items.filter((item) => item.tone === 'negative').length)}</strong><span>NEGATIVE</span></div><div class="summary-mini"><strong>${formatRave(report.items.reduce((sum, item) => sum + articleRave(item), 0))}</strong><span>RAVE</span></div></div>${refreshDraftAction}${prepareFinalAction}${draftRoleHint}${isPending && activeRole === 'executive' ? `<div class="review-item-actions" style="margin-top:13px"><button class="button button-primary button-small" data-action="approve-report" data-id="${esc(report.id)}">Approve final report</button><button class="button button-danger button-small" data-action="request-report-changes" data-id="${esc(report.id)}">Request changes</button></div>` : ''}${isPending && activeRole !== 'executive' ? '<div class="note-box"><strong>Waiting for the executive:</strong> switch to Executive reviewer to record final approval.</div>' : ''}${isApproved && activeRole === 'head' ? `<button class="button button-primary" style="width:100%;margin-top:14px" data-action="deliver-report" data-id="${esc(report.id)}">Prepare client delivery ${icon('arrow')}</button>` : ''}${isApproved && activeRole !== 'head' ? '<div class="note-box"><strong>Final approval complete.</strong> The Monitoring Head can prepare client delivery.</div>' : ''}${isSent ? `<div class="approval-seal" style="margin-top:13px"><span class="approval-seal-icon">✓</span><div><strong>Delivered to client</strong><span>${esc(formatDateTime(report.sentAt))}</span></div></div>` : ''}${isChanges ? `<div class="note-box"><strong>Changes requested:</strong> ${esc(report.reviewNote || 'Review the executive note, update coverage, then compile a new report.')}</div>${revisedReportAction}` : followOnReportAction}<button class="button button-secondary" style="width:100%;margin-top:11px" data-action="go-reports">Open report preview ${icon('arrow')}</button></section>`;
 }
 
 function renderApprovals() {
@@ -434,6 +524,10 @@ function reportToneSummary(report) {
 }
 
 function reportActionButtons(report) {
+  if (report.status === 'draft' && activeRole === 'monitor') {
+    if (hasCoverageChangedSinceReport(report, currentArticles())) return `<button class="button button-primary button-small" data-action="compile-report">Compile updated report snapshot</button>`;
+    return `<button class="button button-primary button-small" data-action="prepare-final-approval" data-id="${esc(report.id)}">Prepare final-approval email ${icon('arrow')}</button>`;
+  }
   if (report.status === 'pending-final' && activeRole === 'executive') {
     return `<button class="button button-primary button-small" data-action="approve-report" data-id="${esc(report.id)}">Approve final report</button><button class="button button-danger button-small" data-action="request-report-changes" data-id="${esc(report.id)}">Request changes</button>`;
   }
@@ -444,16 +538,16 @@ function reportActionButtons(report) {
 }
 
 function reportSuccessorAction(report, articles = currentArticles()) {
-  if (!['changes', 'approved', 'sent'].includes(report.status)) return '';
-  const hasNewerCoverage = articles.some((article) => !report.coverageIds.includes(article.id) || String(article.updatedAt ?? article.createdAt) > String(report.compiledAt));
-  if (!hasNewerCoverage) return '';
+  if (activeRole !== 'monitor' || !['changes', 'approved', 'sent'].includes(report.status)) return '';
+  const hasCoverageChanges = hasCoverageChangedSinceReport(report, articles);
+  if (!hasCoverageChanges) return '';
   const readiness = getReportReadiness(articles);
   const label = report.status === 'changes' ? 'Compile revised report' : 'Compile a new report';
   return `<button class="button button-secondary button-small" data-action="compile-report" ${readiness.ready ? '' : 'disabled'}>${label}</button>`;
 }
 
 function renderReportDocument(report) {
-  const client = getClient(report.clientId);
+  const clientName = report.clientName || getClient(report.clientId)?.name || 'Client';
   const counts = reportToneSummary(report);
   const totalRave = report.items.reduce((sum, item) => sum + articleRave(item), 0);
   const positiveNeutral = report.items.filter((item) => item.tone !== 'negative');
@@ -464,7 +558,7 @@ function renderReportDocument(report) {
     return `<article class="report-article ${item.tone === 'negative' ? 'is-negative' : ''}"><span class="report-article-index">${String(index + 1).padStart(2, '0')}</span><div class="report-article-main"><h4>${esc(item.title)}</h4><p>${esc(item.outletName)} · ${esc(formatDate(item.publishedAt, { month: 'short', day: 'numeric', year: 'numeric' }))} · ${esc(platformLabel(item.medium))} · ${Number(item.measurementCm || 0).toFixed(1)} cm${item.medium === 'print' ? ` × ${esc(item.columns)} columns` : item.wordCount ? ` · ${formatNumber(item.wordCount)} words` : ''}</p><p>${toneBadge(item.tone)} ${url ? `<a class="report-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>` : ''}</p>${image ? `<img class="report-image" src="${esc(image)}" alt="Screenshot of ${esc(item.title)}">` : ''}</div><div class="report-article-rave">${formatRave(articleRave(item))}<small>RAVE</small></div></article>`;
   };
   const formatItems = (items) => items.map((item, index) => article(item, index)).join('');
-  return `<section class="card report-preview"><div class="report-cover"><div class="eyebrow">MEDIA COVERAGE REPORT</div><h2>${esc(client?.name ?? 'Client')}</h2><p>Prepared ${esc(formatDate(report.compiledAt))} · Coverage window and references verified by the client executive</p><div class="report-cover-meta"><span>Report ID <strong>${esc(report.id.slice(-8).toUpperCase())}</strong></span><span>Approval <strong>${esc(statusLabel(report.status))}</strong></span><span>References <strong>${report.items.length}</strong></span></div></div><div class="report-summary-row"><div class="report-summary-cell"><strong>${formatNumber(report.items.length)}</strong><span>CLIPPINGS</span></div><div class="report-summary-cell"><strong>${counts.positive}</strong><span>POSITIVE</span></div><div class="report-summary-cell"><strong>${counts.neutral}</strong><span>NEUTRAL</span></div><div class="report-summary-cell"><strong>${counts.negative}</strong><span>NEGATIVE</span></div></div><div class="report-summary-row" style="grid-template-columns:1fr"><div class="report-summary-cell" style="border:0"><strong>${formatRave(totalRave)}</strong><span>TOTAL RAVE · CALCULATED FROM RECORDED MEASUREMENTS</span></div></div><div class="report-section-heading"><h3>Positive &amp; neutral coverage</h3><span>${positiveNeutral.length} references</span></div>${positiveNeutral.length ? formatItems(positiveNeutral) : '<div class="report-empty-state">No positive or neutral references in this report.</div>'}<div class="report-section-negative"><div class="report-section-heading"><h3 style="color:#a64c43">Negative coverage · priority</h3><span>${negatives.length} references</span></div>${negatives.length ? formatItems(negatives) : '<div class="report-empty-state">No negative references in this report.</div>'}</div><div style="padding:12px 18px 17px;color:#93a19f;font-size:8px;line-height:1.6">RAVE is calculated as online measurement in cm × 6 × 95, or print measurement in cm × columns × 115. It is an estimate based on the entered measurements; the source data and classification should be checked before external use.</div></section>`;
+  return `<section class="card report-preview"><div class="report-cover"><div class="eyebrow">MEDIA COVERAGE REPORT</div><h2>${esc(clientName)}</h2><p>Prepared ${esc(formatDate(report.compiledAt))} · ${report.items.length} executive-verified references</p><div class="report-cover-meta"><span>Report ID <strong>${esc(report.id.slice(-8).toUpperCase())}</strong></span><span>Approval <strong>${esc(reportStatusLabel(report.status))}</strong></span><span>References <strong>${report.items.length}</strong></span></div></div><div class="report-summary-row"><div class="report-summary-cell"><strong>${formatNumber(report.items.length)}</strong><span>CLIPPINGS</span></div><div class="report-summary-cell"><strong>${counts.positive}</strong><span>POSITIVE</span></div><div class="report-summary-cell"><strong>${counts.neutral}</strong><span>NEUTRAL</span></div><div class="report-summary-cell"><strong>${counts.negative}</strong><span>NEGATIVE</span></div></div><div class="report-summary-row" style="grid-template-columns:1fr"><div class="report-summary-cell" style="border:0"><strong>${formatRave(totalRave)}</strong><span>TOTAL RAVE · CALCULATED FROM RECORDED MEASUREMENTS</span></div></div><div class="report-section-heading"><h3>Positive &amp; neutral coverage</h3><span>${positiveNeutral.length} references</span></div>${positiveNeutral.length ? formatItems(positiveNeutral) : '<div class="report-empty-state">No positive or neutral references in this report.</div>'}<div class="report-section-negative"><div class="report-section-heading"><h3 style="color:#a64c43">Negative coverage · priority</h3><span>${negatives.length} references</span></div>${negatives.length ? formatItems(negatives) : '<div class="report-empty-state">No negative references in this report.</div>'}</div><div style="padding:12px 18px 17px;color:#93a19f;font-size:8px;line-height:1.6">RAVE is calculated as online measurement in cm × 6 × 95, or print measurement in cm × columns × 115. It is an estimate based on the entered measurements; the source data and classification should be checked before external use.</div></section>`;
 }
 
 function renderReports() {
@@ -476,8 +570,8 @@ function renderReports() {
     ? `<button class="button button-secondary" data-action="download-report" data-id="${esc(report.id)}">${icon('download')} Download HTML</button>${reportSuccessorAction(report)}${reportActionButtons(report)}`
     : `<button class="button button-secondary" data-action="go-approvals">Open approval desk ${icon('arrow')}</button>`;
   return `${pageHeading('Approval & reporting · Phase 3', 'Client reports', `${esc(client.name)} · Reports contain the approved title, date, media platform, link, screenshot, tone and calculated RAVE for every reference.`, actions)}
-    ${report ? `<div class="report-layout"><div class="report-main">${renderReportDocument(report)}</div><aside class="report-side"><section class="card delivery-card"><h3>Report status</h3><p>${statusBadge(report.status)}<br><br>Compiled ${esc(formatDateTime(report.compiledAt))}${report.approvedAt ? `<br>Approved ${esc(formatDateTime(report.approvedAt))}` : ''}${report.sentAt ? `<br>Sent ${esc(formatDateTime(report.sentAt))}` : ''}</p>${report.status === 'pending-final' && activeRole === 'executive' ? `<button class="button button-primary" data-action="approve-report" data-id="${esc(report.id)}">Approve final report</button><button class="button button-danger" style="width:100%;margin-top:8px" data-action="request-report-changes" data-id="${esc(report.id)}">Request changes</button>` : ''}${report.status === 'pending-final' && activeRole !== 'executive' ? '<div class="dialog-help" style="margin-top:12px">Waiting for final executive approval. Switch to Executive reviewer to record a decision.</div>' : ''}${report.status === 'approved' && activeRole === 'head' ? `<button class="button button-primary" data-action="deliver-report" data-id="${esc(report.id)}">Prepare client delivery ${icon('arrow')}</button>` : ''}${report.status === 'approved' && activeRole !== 'head' ? '<div class="dialog-help" style="margin-top:12px">Final approval is recorded. The Monitoring Head handles client delivery.</div>' : ''}${report.status === 'sent' ? '<div class="approval-seal" style="margin-top:12px"><span class="approval-seal-icon">✓</span><div><strong>Sent to client</strong><span>Delivery recorded in this workspace</span></div></div>' : ''}${report.status === 'changes' && report.reviewNote ? `<div class="dialog-alert" style="margin-top:12px">Executive note: ${esc(report.reviewNote)}</div>` : ''}${reportSuccessorAction(report)}<button class="button button-secondary" data-action="download-report" data-id="${esc(report.id)}">${icon('download')} Download print-ready HTML</button></section><section class="card delivery-card"><h3>Delivery sequence</h3><ul class="status-list"><li class="is-complete">Coverage verified by executive</li><li class="${report.status === 'approved' || report.status === 'sent' ? 'is-complete' : ''}">Final report approved</li><li class="${report.status === 'sent' ? 'is-complete' : ''}">Monitoring Head sends to client</li></ul><p>This app prepares a local report and email draft. Your team sends it through its approved email channel.</p></section></aside></div>` : `<div class="report-layout"><div class="report-main"><section class="card report-empty-state"><strong>No report compiled for ${esc(client.name)} yet</strong>Complete first verification, add screenshots of every article and compile the report for final approval.<div style="margin-top:16px"><button class="button button-primary" data-action="go-approvals">Continue in approval desk ${icon('arrow')}</button></div></section></div><aside class="report-side"><section class="card status-panel"><div class="status-panel-header"><div><h3>Readiness checklist</h3><p>Required before a final report can be compiled.</p></div>${icon('file')}</div>${renderReadinessList(currentArticles())}</section></aside></div>`}
-    ${reports.length > 1 ? `<section class="card" style="margin-top:16px"><div class="card-header"><div><h2 class="card-title">Report history</h2><p class="card-subtitle">Previously compiled snapshots</p></div></div>${reports.slice(1).map((item) => `<div class="report-history-row"><div><div class="report-history-name">${esc(client.name)} · ${esc(formatDate(item.compiledAt))}</div><div class="report-history-meta">${item.items.length} references · ${esc(item.id.slice(-8).toUpperCase())}</div></div>${statusBadge(item.status)}<button class="button button-quiet" data-action="download-report" data-id="${esc(item.id)}">Download</button></div>`).join('')}</section>` : ''}`;
+    ${report ? `<div class="report-layout"><div class="report-main">${renderReportDocument(report)}</div><aside class="report-side"><section class="card delivery-card"><h3>Report status</h3><p>${statusBadge(report.status, 'report')}<br><br>Compiled ${esc(formatDateTime(report.compiledAt))}${report.finalApprovalRequestedAt ? `<br>Approval request sent ${esc(formatDateTime(report.finalApprovalRequestedAt))}` : ''}${report.approvedAt ? `<br>Approved ${esc(formatDateTime(report.approvedAt))}` : ''}${report.sentAt ? `<br>Sent ${esc(formatDateTime(report.sentAt))}` : ''}</p>${report.status === 'draft' && activeRole === 'monitor' ? hasCoverageChangedSinceReport(report, currentArticles()) ? `<button class="button button-primary" data-action="compile-report">Compile updated report snapshot</button>` : `<button class="button button-primary" data-action="prepare-final-approval" data-id="${esc(report.id)}">Prepare final-approval email ${icon('arrow')}</button>` : ''}${report.status === 'draft' && activeRole !== 'monitor' ? '<div class="dialog-help" style="margin-top:12px">The Monitoring team must prepare the final-approval request.</div>' : ''}${report.status === 'pending-final' && activeRole === 'executive' ? `<button class="button button-primary" data-action="approve-report" data-id="${esc(report.id)}">Approve final report</button><button class="button button-danger" style="width:100%;margin-top:8px" data-action="request-report-changes" data-id="${esc(report.id)}">Request changes</button>` : ''}${report.status === 'pending-final' && activeRole !== 'executive' ? '<div class="dialog-help" style="margin-top:12px">Waiting for final executive approval. Switch to Executive reviewer to record a decision.</div>' : ''}${report.status === 'approved' && activeRole === 'head' ? `<button class="button button-primary" data-action="deliver-report" data-id="${esc(report.id)}">Prepare client delivery ${icon('arrow')}</button>` : ''}${report.status === 'approved' && activeRole !== 'head' ? '<div class="dialog-help" style="margin-top:12px">Final approval is recorded. The Monitoring Head handles client delivery.</div>' : ''}${report.status === 'sent' ? '<div class="approval-seal" style="margin-top:12px"><span class="approval-seal-icon">✓</span><div><strong>Sent to client</strong><span>Delivery recorded in this workspace</span></div></div>' : ''}${report.status === 'changes' && report.reviewNote ? `<div class="dialog-alert" style="margin-top:12px">Executive note: ${esc(report.reviewNote)}</div>` : ''}${reportSuccessorAction(report)}<button class="button button-secondary" data-action="download-report" data-id="${esc(report.id)}">${icon('download')} Download print-ready HTML</button></section><section class="card delivery-card"><h3>Delivery sequence</h3><ul class="status-list"><li class="is-complete">Coverage verified by executive</li><li class="${report.status === 'approved' || report.status === 'sent' ? 'is-complete' : ''}">Final report approved</li><li class="${report.status === 'sent' ? 'is-complete' : ''}">Monitoring Head sends to client</li></ul><p>This app prepares a local report and email draft. Your team sends it through its approved email channel.</p></section></aside></div>` : `<div class="report-layout"><div class="report-main"><section class="card report-empty-state"><strong>No report compiled for ${esc(client.name)} yet</strong>Complete first verification, add screenshots of every article and compile the report for final approval.<div style="margin-top:16px"><button class="button button-primary" data-action="go-approvals">Continue in approval desk ${icon('arrow')}</button></div></section></div><aside class="report-side"><section class="card status-panel"><div class="status-panel-header"><div><h3>Readiness checklist</h3><p>Required before a final report can be compiled.</p></div>${icon('file')}</div>${renderReadinessList(currentArticles())}</section></aside></div>`}
+    ${reports.length > 1 ? `<section class="card" style="margin-top:16px"><div class="card-header"><div><h2 class="card-title">Report history</h2><p class="card-subtitle">Previously compiled snapshots</p></div></div>${reports.slice(1).map((item) => `<div class="report-history-row"><div><div class="report-history-name">${esc(client.name)} · ${esc(formatDate(item.compiledAt))}</div><div class="report-history-meta">${item.items.length} references · ${esc(item.id.slice(-8).toUpperCase())}</div></div>${statusBadge(item.status, 'report')}<button class="button button-quiet" data-action="download-report" data-id="${esc(item.id)}">Download</button></div>`).join('')}</section>` : ''}`;
 }
 
 function renderClientCard(client) {
@@ -569,8 +663,10 @@ function coverageOutletOptions(selectedId = '') {
 }
 
 function openCoverageDialog(articleId = '') {
+  if (activeRole !== 'monitor') { toast('Switch to Monitoring team to add or edit coverage.', 'warning'); return; }
   const client = getClient();
   if (!client) { openClientDialog(); return; }
+  cancelScreenshotCompression();
   const article = articleId ? state.coverage.find((item) => item.id === articleId) : null;
   const pendingFinal = latestReport(client.id);
   if (article && pendingFinal?.status === 'pending-final' && pendingFinal.coverageIds?.includes(article.id)) {
@@ -611,6 +707,7 @@ function openCoverageDialog(articleId = '') {
 }
 
 function openVerificationDialog() {
+  if (activeRole !== 'monitor') { toast('Switch to Monitoring team to prepare the verification packet.', 'warning'); return; }
   const client = getClient(); const articles = currentArticles();
   if (!client || !articles.length) { toast('Add coverage references before preparing a verification packet.', 'warning'); return; }
   const name = client.executiveName || 'Executive reviewer';
@@ -621,23 +718,42 @@ function openVerificationDialog() {
   showDialog('Prepare first-verification packet', 'EXECUTIVE REVIEW · STEP 1', `<div class="dialog-alert">This local workspace does not send email. Review the draft, copy it or open it in your mail app, then confirm only after you have sent the request.</div><div class="form-field" style="margin-top:13px"><span class="form-label">To · ${esc(name)}</span><div class="query-box"><code>${esc(client.executiveEmail || 'Add an executive email in Clients & outlets')}</code></div></div><div class="form-field" style="margin-top:11px"><label class="form-label" for="verificationDraft">Message draft · ${articles.length} references</label><textarea class="textarea" id="verificationDraft" readonly style="min-height:210px">${esc(`Subject: ${subject}\n\n${body}`)}</textarea></div><div class="dialog-actions" style="justify-content:space-between"><div style="display:flex;gap:8px"><button class="button button-secondary" type="button" data-action="copy-text" data-target="verificationDraft">${icon('copy')} Copy draft</button>${mailto ? `<a class="button button-secondary" href="${esc(mailto)}">Open email app ${icon('external')}</a>` : ''}</div><button class="button button-primary" type="button" data-action="confirm-review-request">I’ve sent the request</button></div>`);
 }
 
+function openFinalApprovalDialog(reportId) {
+  const report = state.reports.find((item) => item.id === reportId);
+  const client = report ? getClient(report.clientId) : null;
+  if (!report || !client || activeRole !== 'monitor') { toast('Switch to Monitoring team to prepare final approval.', 'warning'); return; }
+  if (report.status !== 'draft') { toast('Only a compiled draft can be sent for final approval.', 'warning'); return; }
+  const articles = state.coverage.filter((article) => article.clientId === client.id);
+  if (hasCoverageChangedSinceReport(report, articles)) { toast('Coverage changed after this snapshot. Compile the updated report before requesting approval.', 'warning'); return; }
+  const readiness = getReportReadiness(report.items);
+  if (!readiness.ready) { toast(readiness.reasons.join(' '), 'warning'); return; }
+  const name = client.executiveName || 'Executive reviewer';
+  const clientName = report.clientName || client.name;
+  const subject = `Final approval: Media coverage report — ${clientName}`;
+  const negatives = report.items.filter((item) => item.tone === 'negative').length;
+  const body = `Hi ${name},\n\nPlease review the attached final media coverage report for ${clientName}. It contains ${report.items.length} verified references, including ${negatives} negative item${negatives === 1 ? '' : 's'}.\n\nPlease approve the report or send back any changes before it is delivered to the client.\n\nThank you`;
+  const email = safeEmail(client.executiveEmail);
+  const mailto = email ? `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}` : '';
+  showDialog('Prepare final-approval request', 'EXECUTIVE REVIEW · FINAL APPROVAL', `<div class="dialog-alert">This report is compiled but not yet sent. Download and attach the report, then send the draft through your approved email channel. This local app does not send email.</div><div class="form-field" style="margin-top:13px"><span class="form-label">To · ${esc(name)}</span><div class="query-box"><code>${esc(email || 'Add an executive email in Clients & outlets')}</code></div></div><div class="form-field" style="margin-top:11px"><label class="form-label" for="finalApprovalDraft">Message draft · ${report.items.length} references</label><textarea class="textarea" id="finalApprovalDraft" readonly style="min-height:190px">${esc(`Subject: ${subject}\n\n${body}`)}</textarea></div><div class="dialog-actions" style="justify-content:space-between"><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="button button-secondary" type="button" data-action="copy-text" data-target="finalApprovalDraft">${icon('copy')} Copy draft</button><button class="button button-secondary" type="button" data-action="download-report" data-id="${esc(report.id)}">${icon('download')} Download report</button>${mailto ? `<a class="button button-secondary" href="${esc(mailto)}">Open email app ${icon('external')}</a>` : ''}</div><button class="button button-primary" type="button" data-action="confirm-final-approval" data-id="${esc(report.id)}">I’ve sent the request</button></div>`);
+}
+
 function openCoverageChangeDialog(articleId) {
   const article = state.coverage.find((item) => item.id === articleId);
-  if (!article) return;
+  if (!article || activeRole !== 'executive' || article.verificationStatus !== 'pending') { toast('Only the Executive reviewer can request changes on a pending reference.', 'warning'); return; }
   showDialog('Request a correction', 'FIRST VERIFICATION', `<form class="dialog-form" id="coverageChangeForm" data-id="${esc(article.id)}"><p class="form-hint" style="font-size:9px;color:#6f8384">${esc(article.outletName)} · ${esc(article.title)}</p><div class="form-field"><label class="form-label" for="coverageReviewNote">Executive note</label><textarea class="textarea" id="coverageReviewNote" name="note" required maxlength="600" placeholder="What needs to be corrected or verified?">${esc(article.verificationNote ?? '')}</textarea></div><div class="form-error" role="alert"></div><div class="dialog-actions"><button type="button" class="button button-secondary" data-dialog-close>Cancel</button><button type="submit" class="button button-danger">Request correction</button></div></form>`);
 }
 
 function openReportChangeDialog(reportId) {
   const report = state.reports.find((item) => item.id === reportId);
-  if (!report) return;
+  if (!report || activeRole !== 'executive' || report.status !== 'pending-final') { toast('Only the Executive reviewer can request changes on a pending final report.', 'warning'); return; }
   showDialog('Request report changes', 'FINAL APPROVAL', `<form class="dialog-form" id="reportChangeForm" data-id="${esc(report.id)}"><div class="form-field"><label class="form-label" for="reportReviewNote">Executive note</label><textarea class="textarea" id="reportReviewNote" name="note" required maxlength="600" placeholder="Describe what needs to change before approval."></textarea></div><div class="form-error" role="alert"></div><div class="dialog-actions"><button type="button" class="button button-secondary" data-dialog-close>Cancel</button><button type="submit" class="button button-danger">Request changes</button></div></form>`);
 }
 
 function openDeliveryDialog(reportId) {
   const report = state.reports.find((item) => item.id === reportId); const client = report ? getClient(report.clientId) : null;
-  if (!report || !client) return;
-  const contact = client.contactName || 'Communications team'; const subject = `Approved media coverage report — ${client.name}`;
-  const body = `Hello ${contact},\n\nPlease find attached the approved media coverage report for ${client.name}. It includes verified coverage references, screenshots, tone classification and RAVE estimates.\n\nRegards,\n${state.clients.length ? 'Monitoring Head' : 'Media Monitoring'}`;
+  if (!report || !client || activeRole !== 'head' || report.status !== 'approved') { toast('Only the Monitoring Head can prepare delivery after final approval.', 'warning'); return; }
+  const contact = client.contactName || 'Communications team'; const clientName = report.clientName || client.name; const subject = `Approved media coverage report — ${clientName}`;
+  const body = `Hello ${contact},\n\nPlease find attached the approved media coverage report for ${clientName}. It includes verified coverage references, screenshots, tone classification and RAVE estimates.\n\nRegards,\n${state.clients.length ? 'Monitoring Head' : 'Media Monitoring'}`;
   const email = safeEmail(client.contactEmail);
   const mailto = email ? `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}` : '';
   showDialog('Prepare client delivery', 'MONITORING HEAD · STEP 3', `<div class="dialog-alert">The report has final executive approval. Download the HTML report, attach it to the email and send through your approved channel. This prototype does not send email itself.</div><div class="form-field" style="margin-top:13px"><span class="form-label">To · ${esc(contact)}</span><div class="query-box"><code>${esc(email || 'Add the client email in Clients & outlets')}</code></div></div><div class="form-field" style="margin-top:11px"><label class="form-label" for="deliveryDraft">Email draft</label><textarea class="textarea" id="deliveryDraft" readonly style="min-height:120px">${esc(`Subject: ${subject}\n\n${body}`)}</textarea></div><div class="dialog-actions" style="justify-content:space-between"><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="button button-secondary" type="button" data-action="download-report" data-id="${esc(report.id)}">${icon('download')} Download report</button>${mailto ? `<a class="button button-secondary" href="${esc(mailto)}">Open email app ${icon('external')}</a>` : ''}</div><button class="button button-primary" type="button" data-action="confirm-delivery" data-id="${esc(report.id)}">I’ve sent it to the client</button></div>`);
@@ -664,18 +780,21 @@ async function compressScreenshot(file) {
   if (file.size > 15 * 1024 * 1024) throw new Error('Screenshot must be smaller than 15 MB before compression.');
   if (typeof createImageBitmap !== 'function') throw new Error('This browser cannot compress images. Use a smaller JPG or PNG screenshot.');
   const bitmap = await createImageBitmap(file);
-  const maxDimension = 1440;
-  const ratio = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height));
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.round(bitmap.width * ratio));
-  canvas.height = Math.max(1, Math.round(bitmap.height * ratio));
-  const context = canvas.getContext('2d', { alpha: false });
-  if (!context) throw new Error('Could not read the screenshot.');
-  context.fillStyle = '#ffffff';
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  bitmap.close?.();
-  return canvas.toDataURL('image/jpeg', 0.78);
+  try {
+    const maxDimension = 1440;
+    const ratio = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bitmap.width * ratio));
+    canvas.height = Math.max(1, Math.round(bitmap.height * ratio));
+    const context = canvas.getContext('2d', { alpha: false });
+    if (!context) throw new Error('Could not read the screenshot.');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.78);
+  } finally {
+    bitmap.close?.();
+  }
 }
 
 function handleClientSubmit(form) {
@@ -744,6 +863,7 @@ function handleOutletSubmit(form) {
 }
 
 function handleCoverageSubmit(form) {
+  if (activeRole !== 'monitor') return showFormError(form, 'Switch to Monitoring team to edit coverage.');
   const fields = new FormData(form);
   const client = getClient(form.dataset.client);
   if (!client) return showFormError(form, 'Choose a valid client.');
@@ -788,6 +908,7 @@ function handleCoverageChangeSubmit(form) {
   const article = state.coverage.find((item) => item.id === form.dataset.id);
   if (!article) return closeDialog();
   if (activeRole !== 'executive') return showFormError(form, 'Switch to Executive reviewer before recording a decision.');
+  if (article.verificationStatus !== 'pending') return showFormError(form, 'This reference is no longer awaiting a first-verification decision.');
   const note = String(new FormData(form).get('note') ?? '').trim();
   if (!note) return showFormError(form, 'Explain what needs correction.');
   article.verificationStatus = 'changes'; article.verificationNote = note; article.verifiedBy = getClient(article.clientId)?.executiveName ?? 'Executive reviewer'; article.verifiedAt = nowISO();
@@ -799,6 +920,7 @@ function handleReportChangeSubmit(form) {
   const report = state.reports.find((item) => item.id === form.dataset.id);
   if (!report) return closeDialog();
   if (activeRole !== 'executive') return showFormError(form, 'Switch to Executive reviewer before recording a decision.');
+  if (report.status !== 'pending-final') return showFormError(form, 'This report is no longer awaiting final executive approval.');
   const note = String(new FormData(form).get('note') ?? '').trim();
   if (!note) return showFormError(form, 'Explain what needs to change.');
   report.status = 'changes'; report.reviewNote = note; report.requestedChangesAt = nowISO(); report.reviewedBy = getClient(report.clientId)?.executiveName ?? 'Executive reviewer';
@@ -807,6 +929,7 @@ function handleReportChangeSubmit(form) {
 }
 
 function markVerificationRequestSent() {
+  if (activeRole !== 'monitor') { toast('Switch to Monitoring team to record the verification handoff.', 'warning'); return; }
   const client = getClient(); const articles = currentArticles();
   if (!client || !articles.length) return;
   articles.forEach((article) => {
@@ -819,23 +942,41 @@ function markVerificationRequestSent() {
   closeDialog(); persist({ rerender: true }); toast('Verification request recorded. The executive can now review each reference.');
 }
 
+function markFinalApprovalRequestSent(reportId) {
+  const report = state.reports.find((item) => item.id === reportId);
+  const client = report ? getClient(report.clientId) : null;
+  if (!report || !client || activeRole !== 'monitor' || report.status !== 'draft') return;
+  const articles = state.coverage.filter((article) => article.clientId === client.id);
+  if (hasCoverageChangedSinceReport(report, articles)) {
+    toast('Coverage changed after this snapshot. Compile the updated report before sending it for approval.', 'warning');
+    return;
+  }
+  const readiness = getReportReadiness(report.items);
+  if (!readiness.ready) { toast(readiness.reasons.join(' '), 'warning'); return; }
+  report.status = 'pending-final';
+  report.finalApprovalRequestedAt = nowISO();
+  report.requestedBy = 'Monitoring team';
+  addActivity(client.id, `Monitoring team confirmed sending the final-approval report to ${client.executiveName || 'the executive'}.`, 'approval');
+  closeDialog(); persist({ rerender: true }); toast('Final-approval request recorded. The executive can now approve the report or request changes.');
+}
+
 function compileReport() {
   const client = getClient(); const articles = currentArticles();
   if (!client) return;
+  if (activeRole !== 'monitor') { toast('Switch to Monitoring team to compile the report.', 'warning'); return; }
   const previousReport = latestReport(client.id);
   if (previousReport?.status === 'pending-final') { toast('A report is already awaiting final approval. Wait for the executive decision first.', 'warning'); return; }
-  const hasNewerCoverage = !previousReport || articles.some((article) => !previousReport.coverageIds.includes(article.id) || String(article.updatedAt ?? article.createdAt) > String(previousReport.compiledAt));
-  if (previousReport && !hasNewerCoverage) { toast('Update coverage or add new references before compiling another report.', 'warning'); return; }
+  if (previousReport && !hasCoverageChangedSinceReport(previousReport, articles)) { toast('Update coverage or add new references before compiling another report.', 'warning'); return; }
   const readiness = getReportReadiness(articles);
   if (!readiness.ready) { toast(readiness.reasons.join(' '), 'warning'); return; }
   const report = {
-    id: uid('report'), clientId: client.id, coverageIds: articles.map((article) => article.id),
-    items: articles.map((article) => ({ ...article })), status: 'pending-final', compiledAt: nowISO(),
+    id: uid('report'), clientId: client.id, clientName: client.name, coverageIds: articles.map((article) => article.id),
+    items: articles.map((article) => ({ ...article })), status: 'draft', compiledAt: nowISO(),
     approvedAt: '', sentAt: '', reviewNote: '', approver: client.executiveName || 'Executive reviewer',
   };
   state.reports.unshift(report);
-  addActivity(client.id, `Coverage report compiled for ${client.name} and sent for final executive approval.`, 'approval');
-  persist({ rerender: true }); toast('Report compiled. It is now awaiting final executive approval.');
+  addActivity(client.id, `Coverage report compiled for ${client.name}; the final-approval email has not been sent.`, 'approval');
+  persist({ rerender: true }); toast('Report compiled as a draft. Prepare the final-approval email and confirm after sending it.');
 }
 
 function approveCoverage(articleId) {
@@ -872,7 +1013,7 @@ function googleSearchUrl(query, run) {
 }
 
 function createPrintableReport(report) {
-  const client = getClient(report.clientId); const title = `Media coverage report — ${client?.name ?? 'Client'}`;
+  const title = `Media coverage report — ${report.clientName || getClient(report.clientId)?.name || 'Client'}`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(title)}</title><style>
     *{box-sizing:border-box}body{margin:0;padding:34px;color:#183037;background:#f4f7f5;font:14px/1.55 Arial,sans-serif}.print-toolbar{display:flex;max-width:930px;justify-content:flex-end;margin:0 auto 13px}.print-toolbar button{padding:9px 15px;border:0;border-radius:7px;color:#fff;background:#087f73;font-weight:700;cursor:pointer}.report-preview{max-width:930px;margin:0 auto;overflow:hidden;border:1px solid #dfe8e4;border-radius:14px;background:#fff;box-shadow:0 12px 35px rgba(20,50,50,.08)}.report-cover{padding:28px;color:#eef8f3;background:linear-gradient(125deg,#15373b,#19474a)}.eyebrow{margin-bottom:8px;color:#b5d383;font-size:10px;font-weight:700;letter-spacing:1.5px}.report-cover h2{margin:0;font-size:27px}.report-cover p{color:#d0dfd8;font-size:12px}.report-cover-meta{display:flex;gap:20px;margin-top:17px;color:#d0dfd8;font-size:10px}.report-summary-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:15px 20px;border-bottom:1px solid #e9efec}.report-summary-cell strong{display:block;color:#29494a;font-size:18px}.report-summary-cell span{color:#839493;font-size:9px}.report-section-heading{display:flex;justify-content:space-between;padding:16px 20px 9px;border-top:1px solid #eee}.report-section-heading h3{margin:0;font-size:12px}.report-section-heading span{color:#889999;font-size:10px}.report-article{display:grid;grid-template-columns:38px 1fr 100px;gap:12px;padding:13px 20px;border-top:1px solid #edf1ef}.report-article.is-negative{border-left:4px solid #d47a68;background:#fffaf8}.report-article-index{display:grid;width:31px;height:31px;place-items:center;border-radius:8px;color:#47706b;background:#edf5f0;font-size:9px;font-weight:bold}.report-article-main h4{margin:0;color:#29464b;font-size:12px}.report-article-main p{margin:5px 0;color:#718385;font-size:10px;word-break:break-word}.tone-badge{display:inline-block;margin-right:7px;padding:3px 7px;border-radius:16px;font-size:9px;font-weight:bold}.tone-positive{color:#25826d;background:#e5f5ed}.tone-neutral{color:#6f7e83;background:#eff2f1}.tone-negative{color:#b74f49;background:#fff0ed}.report-link{color:#087f73}.report-article-rave{text-align:right;color:#315a56;font-size:12px;font-weight:bold}.report-article-rave small{display:block;color:#839493;font-size:9px;font-weight:normal}.report-image{display:block;max-width:100%;max-height:340px;margin-top:8px;border:1px solid #e3ebe7;border-radius:6px;object-fit:contain}.report-section-negative{border-top:1px solid #f2e2de;background:#fffcfb}.report-empty-state{padding:25px;color:#829392;text-align:center}.report-preview>div:last-child{padding:14px 20px;color:#82908f;font-size:9px}.report-cover-meta strong{color:#fff}.report-preview .report-summary-row:nth-of-type(3){grid-template-columns:1fr}.report-summary-cell{padding:4px}.report-preview .report-article{break-inside:avoid}.report-preview .report-section-heading{break-after:avoid}@media(max-width:650px){body{padding:10px}.report-article{grid-template-columns:30px 1fr}.report-article-rave{grid-column:2;text-align:left}.report-summary-row{grid-template-columns:repeat(2,1fr)}.report-cover-meta{flex-direction:column;gap:5px}}@media print{body{padding:0;background:#fff}.print-toolbar{display:none}.report-preview{max-width:none;border:0;border-radius:0;box-shadow:none}.report-cover{-webkit-print-color-adjust:exact;print-color-adjust:exact}.report-article.is-negative,.tone-badge,.report-section-negative{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
   </style></head><body><div class="print-toolbar"><button onclick="window.print()">Print / Save as PDF</button></div>${renderReportDocument(report)}</body></html>`;
@@ -907,6 +1048,7 @@ async function copyText(value) {
 }
 
 function confirmDeleteCoverage(articleId) {
+  if (activeRole !== 'monitor') { toast('Switch to Monitoring team to remove coverage.', 'warning'); return; }
   const article = state.coverage.find((item) => item.id === articleId);
   if (!article) return;
   const report = latestReport(article.clientId);
@@ -939,6 +1081,7 @@ function dispatchAction(action, trigger) {
     case 'edit-coverage': openCoverageDialog(id); return;
     case 'delete-coverage': confirmDeleteCoverage(id); return;
     case 'confirm-delete-coverage': {
+      if (activeRole !== 'monitor') { closeDialog(); toast('Switch to Monitoring team to remove coverage.', 'warning'); return; }
       const article = state.coverage.find((item) => item.id === id);
       const report = article ? latestReport(article.clientId) : null;
       if (report?.status === 'pending-final' && report.coverageIds?.includes(id)) { closeDialog(); toast('This reference is in a report awaiting final approval.', 'warning'); return; }
@@ -987,6 +1130,8 @@ function dispatchAction(action, trigger) {
     case 'approve-coverage': approveCoverage(id); return;
     case 'request-coverage-changes': openCoverageChangeDialog(id); return;
     case 'compile-report': compileReport(); return;
+    case 'prepare-final-approval': openFinalApprovalDialog(id); return;
+    case 'confirm-final-approval': markFinalApprovalRequestSent(id); return;
     case 'approve-report': approveReport(id); return;
     case 'request-report-changes': openReportChangeDialog(id); return;
     case 'deliver-report': openDeliveryDialog(id); return;
@@ -1050,18 +1195,43 @@ function handlePageChange(event) {
   if (target.id === 'coverageScreenshot') {
     const file = target.files?.[0];
     if (!file) return;
+    const token = ++screenshotToken;
+    screenshotPending = true;
+    activeScreenshotData = '';
+    const form = target.form;
+    const submit = form?.querySelector('button[type="submit"]');
+    if (submit) {
+      submit.dataset.readyText ??= submit.textContent;
+      submit.textContent = 'Compressing screenshot…';
+      submit.disabled = true;
+    }
+    const preview = dialogBody.querySelector('#screenshotPreview');
+    if (preview) { preview.removeAttribute('src'); preview.hidden = true; }
     compressScreenshot(file).then((image) => {
+      if (token !== screenshotToken) return;
       activeScreenshotData = image;
-      const preview = dialogBody.querySelector('#screenshotPreview');
-      if (preview) { preview.src = image; preview.hidden = false; }
+      screenshotPending = false;
+      if (submit) { submit.textContent = submit.dataset.readyText; submit.disabled = false; }
+      const currentPreview = dialogBody.querySelector('#screenshotPreview');
+      if (currentPreview) { currentPreview.src = image; currentPreview.hidden = false; }
       toast('Screenshot compressed and attached to this coverage item.');
-    }).catch((error) => toast(error.message || 'Could not read this screenshot.', 'error'));
+    }).catch((error) => {
+      if (token !== screenshotToken) return;
+      screenshotPending = false;
+      if (submit) { submit.textContent = submit.dataset.readyText; submit.disabled = false; }
+      toast(error.message || 'Could not read this screenshot.', 'error');
+    });
   }
 }
 
 function handleDialogSubmit(event) {
   const form = event.target;
   if (!(form instanceof HTMLFormElement)) return;
+  if (form.id === 'coverageForm' && screenshotPending) {
+    event.preventDefault();
+    showFormError(form, 'Wait for the screenshot to finish compressing before saving this coverage item.');
+    return;
+  }
   const handlers = {
     clientForm: handleClientSubmit,
     releaseForm: handleReleaseSubmit,
@@ -1076,6 +1246,7 @@ function handleDialogSubmit(event) {
 }
 
 function boot() {
+  document.querySelectorAll('.nav-icon[data-icon]').forEach((node) => { node.innerHTML = icon(node.dataset.icon); });
   renderSidebar();
   document.querySelectorAll('.nav-link[data-view]').forEach((button) => button.addEventListener('click', () => navigate(button.dataset.view)));
   document.querySelectorAll('[data-nav]').forEach((button) => button.addEventListener('click', (event) => { event.preventDefault(); navigate(button.dataset.nav); }));
@@ -1112,7 +1283,7 @@ function boot() {
   dialogBody.addEventListener('submit', handleDialogSubmit);
   dialog.querySelector('[data-dialog-close]').addEventListener('click', (event) => { event.preventDefault(); closeDialog(); });
   dialog.addEventListener('click', (event) => { if (event.target === dialog) closeDialog(); });
-  dialog.addEventListener('close', () => { activeScreenshotData = ''; });
+  dialog.addEventListener('cancel', () => { cancelScreenshotCompression(); activeScreenshotData = ''; });
   if (!state.clients.length) currentView = 'setup';
   renderPage();
 }
